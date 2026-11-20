@@ -1,0 +1,282 @@
+name: Android Debug APK Build
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - develop
+  pull_request:
+    branches:
+      - main
+      - master
+      - develop
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-debug-apk-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-debug-apk:
+    name: Build & Verify Android Debug APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: 1. Checkout repository
+        uses: actions/checkout@v7
+
+      - name: 2. Detect project build architecture & Android module
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Detect package manager from actual committed lockfile
+          if [ -f "bun.lock" ] || [ -f "bun.lockb" ]; then
+            PM="bun"
+          elif [ -f "package-lock.json" ]; then
+            PM="npm"
+          elif [ -f "pnpm-lock.yaml" ]; then
+            PM="pnpm"
+          elif [ -f "yarn.lock" ]; then
+            PM="yarn"
+          else
+            PM="npm"
+          fi
+
+          # Detect Capacitor webDir from capacitor.config.ts or capacitor.config.json
+          WEB_DIR="dist"
+          if [ -f "capacitor.config.ts" ]; then
+            DETECTED_DIR=$(python3 -c '
+          import re, pathlib
+          txt = pathlib.Path("capacitor.config.ts").read_text(encoding="utf-8")
+          m = re.search(r"webDir\s*:\s*[\x27\"]([^\x27\"]+)[\x27\"]", txt)
+          print(m.group(1) if m else "dist")
+          ')
+            WEB_DIR="$DETECTED_DIR"
+          elif [ -f "capacitor.config.json" ]; then
+            DETECTED_DIR=$(python3 -c '
+          import json, pathlib
+          cfg = json.loads(pathlib.Path("capacitor.config.json").read_text(encoding="utf-8"))
+          print(cfg.get("webDir", "dist"))
+          ')
+            WEB_DIR="$DETECTED_DIR"
+          fi
+
+          # Verify Android project exists (never regenerate destructively in CI)
+          if [ ! -d "android" ] || [ ! -f "android/settings.gradle" ]; then
+            echo "[ERROR_CATEGORY: ENVIRONMENT_FAILURE] Missing committed android/ project or android/settings.gradle." >&2
+            exit 1
+          fi
+
+          # Detect Android application module dynamically from settings.gradle and com.android.application plugin
+          APP_MODULE=$(python3 -c '
+          import pathlib, re
+          android_dir = pathlib.Path("android")
+          found = []
+          for build_file in sorted(android_dir.glob("*/build.gradle*")):
+              txt = build_file.read_text(encoding="utf-8")
+              if re.search(r"com\.android\.application", txt):
+                  found.append(build_file.parent.name)
+          if not found:
+              raise SystemExit("No Android application module found")
+          print(found[0])
+          ')
+
+          # Detect compileSdkVersion dynamically from variables.gradle or module build.gradle
+          COMPILE_SDK=$(python3 -c '
+          import pathlib, re
+          android_dir = pathlib.Path("android")
+          for candidate in [android_dir / "variables.gradle", android_dir / "'"$APP_MODULE"'" / "build.gradle", android_dir / "'"$APP_MODULE"'" / "build.gradle.kts"]:
+              if candidate.is_file():
+                  txt = candidate.read_text(encoding="utf-8")
+                  m = re.search(r"\bcompileSdk(?:Version)?\s*=?\s*(\d+)", txt)
+                  if m:
+                      print(m.group(1))
+                      raise SystemExit(0)
+          print("36")
+          ')
+
+          echo "package_manager=${PM}" >> "$GITHUB_OUTPUT"
+          echo "web_dir=${WEB_DIR}" >> "$GITHUB_OUTPUT"
+          echo "app_module=${APP_MODULE}" >> "$GITHUB_OUTPUT"
+          echo "compile_sdk=${COMPILE_SDK}" >> "$GITHUB_OUTPUT"
+
+          echo "Detected Package Manager: ${PM}"
+          echo "Detected Web Output Dir:  ${WEB_DIR}"
+          echo "Detected Android Module:  :${APP_MODULE}"
+          echo "Detected Compile SDK:     API ${COMPILE_SDK}"
+
+      - name: 3. Setup Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: 4. Setup Bun (when bun.lock is detected)
+        if: steps.detect.outputs.package_manager == 'bun'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.4"
+
+      - name: 5. Install locked dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ steps.detect.outputs.package_manager }}" in
+            bun)
+              bun install --frozen-lockfile
+              ;;
+            npm)
+              npm ci
+              ;;
+            pnpm)
+              corepack enable
+              pnpm install --frozen-lockfile
+              ;;
+            yarn)
+              corepack enable
+              yarn install --immutable
+              ;;
+            *)
+              echo "[ERROR_CATEGORY: ENVIRONMENT_FAILURE] Unsupported package manager: ${{ steps.detect.outputs.package_manager }}" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: 6. Run TypeScript check, web unit tests & CI verifier self-tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          PM="${{ steps.detect.outputs.package_manager }}"
+          "$PM" run lint
+          "$PM" run test
+          python3 -m unittest discover -s scripts/ci -p "test_*.py" -v
+
+      - name: 7. Build production web assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          PM="${{ steps.detect.outputs.package_manager }}"
+          "$PM" run build
+
+          WEB_DIR="${{ steps.detect.outputs.web_dir }}"
+          if [ ! -f "${WEB_DIR}/index.html" ]; then
+            echo "[ERROR_CATEGORY: SOURCE_BUILD_FAILURE] Expected production web output '${WEB_DIR}/index.html' not found." >&2
+            exit 1
+          fi
+
+      - name: 8. Synchronize Capacitor Android assets (non-destructive)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.detect.outputs.package_manager }}" = "bun" ]; then
+            bunx cap sync android
+          else
+            npx cap sync android
+          fi
+
+          SYNCED_HTML="android/${{ steps.detect.outputs.app_module }}/src/main/assets/public/index.html"
+          if [ ! -f "${SYNCED_HTML}" ]; then
+            echo "[ERROR_CATEGORY: SOURCE_BUILD_FAILURE] Synced Capacitor web asset missing at ${SYNCED_HTML}" >&2
+            exit 1
+          fi
+
+      - name: 9. Setup JDK 21 (Temurin)
+        uses: actions/setup-java@v5
+        with:
+          distribution: "temurin"
+          java-version: "21"
+
+      - name: 10. Setup Android SDK (Compile SDK, Build Tools & Command-Line Tools)
+        uses: android-actions/setup-android@v4
+        with:
+          packages: >-
+            platforms;android-${{ steps.detect.outputs.compile_sdk }}
+            build-tools;${{ steps.detect.outputs.compile_sdk }}.0.0
+            cmdline-tools;latest
+            platform-tools
+
+      - name: 11. Setup Gradle caching (Gradle Wrapper only)
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: 12. Validate Gradle Wrapper, JDK & SDK tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "JAVA_HOME=${JAVA_HOME:-<unset>}"
+          java -version
+          chmod +x android/gradlew
+          cd android
+          ./gradlew --version --no-daemon
+
+      - name: 13. Run Android Debug unit tests
+        shell: bash
+        working-directory: android
+        run: |
+          set -euo pipefail
+          ./gradlew ":${{ steps.detect.outputs.app_module }}:testDebugUnitTest" --no-daemon
+
+      - name: 14. Run Android Debug lint
+        shell: bash
+        working-directory: android
+        run: |
+          set -euo pipefail
+          ./gradlew ":${{ steps.detect.outputs.app_module }}:lintDebug" --no-daemon
+
+      - name: 15. Compile Android Debug APK ONLY (no release or AAB tasks)
+        shell: bash
+        run: |
+          set -euo pipefail
+          touch .ci-debug-build-start.marker
+          cd android
+          ./gradlew ":${{ steps.detect.outputs.app_module }}:assembleDebug" --no-daemon
+
+      - name: 16. Discover, verify APK metadata, check integrity & generate SHA-256
+        id: verify_apk
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/verify-android-debug-apk.py \
+            --android-dir android \
+            --module "${{ steps.detect.outputs.app_module }}" \
+            --variant debug \
+            --build-marker .ci-debug-build-start.marker
+
+      - name: 17. Upload verified Android Debug APK & SHA-256 artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: Ganaka-Android-Debug-APK
+          path: |
+            ${{ steps.verify_apk.outputs.apk_path }}
+            ${{ steps.verify_apk.outputs.sha256_path }}
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: 18. Publish build & verification summary
+        if: success()
+        shell: bash
+        run: |
+          {
+            echo "## Android Debug APK Build Summary"
+            echo ""
+            echo "| Field | Verified Value |"
+            echo "| :--- | :--- |"
+            echo "| **Artifact Name** | \`Ganaka-Android-Debug-APK\` |"
+            echo "| **APK Filename** | \`${{ steps.verify_apk.outputs.apk_filename }}\` |"
+            echo "| **APK Size** | ${{ steps.verify_apk.outputs.apk_size_human }} |"
+            echo "| **SHA-256** | \`${{ steps.verify_apk.outputs.sha256 }}\` |"
+            echo "| **Application ID** | \`${{ steps.verify_apk.outputs.application_id }}\` |"
+            echo "| **Version Code** | \`${{ steps.verify_apk.outputs.version_code }}\` |"
+            echo "| **Version Name** | \`${{ steps.verify_apk.outputs.version_name }}\` |"
+            echo "| **Min SDK / Target SDK** | API \`${{ steps.verify_apk.outputs.min_sdk }}\` / API \`${{ steps.verify_apk.outputs.target_sdk }}\` |"
+            echo "| **Debuggable** | \`${{ steps.verify_apk.outputs.debuggable }}\` |"
+            echo "| **Inspection Tool** | \`${{ steps.verify_apk.outputs.inspection_tool }}\` |"
+            echo "| **Signature Check** | \`${{ steps.verify_apk.outputs.signature_status }}\` |"
+            echo ""
+            echo "> **Scope note**: Compilation, ZIP/APK integrity, manifest metadata, and debug signature are verified in CI. Physical-device installation and runtime behavior require testing on an Android device or emulator."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,6 @@
+{
+  "name": "Ganaka — Indian Clerk Calculator",
+  "description": "A fast, tactile Indian business and clerk calculator with Lakhs & Crores formatting, live Indian words, Check & Correct step replay, Indian GST slabs, and Rupee cash denomination counter.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
