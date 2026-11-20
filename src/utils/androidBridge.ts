@@ -10,19 +10,45 @@ export function isNativeAndroid(): boolean {
   return Capacitor.isNativePlatform() && Capacitor.getPlatform() === 'android';
 }
 
+function waitForNextFrame(): Promise<void> {
+  if (typeof window === 'undefined' || typeof window.requestAnimationFrame !== 'function') {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    window.requestAnimationFrame(() => resolve());
+  });
+}
+
+async function waitForFontsOrTimeout(timeoutMs: number): Promise<void> {
+  if (typeof document === 'undefined' || !('fonts' in document)) return;
+  try {
+    await Promise.race([
+      document.fonts.ready,
+      new Promise<void>((resolve) => {
+        window.setTimeout(resolve, timeoutMs);
+      }),
+    ]);
+  } catch {
+    // Continue seamlessly when offline or Font Loading API is unavailable
+  }
+}
+
 export async function hideAndroidSplash(): Promise<void> {
   if (!Capacitor.isNativePlatform()) return;
   try {
-    await SplashScreen.hide({ fadeOutDuration: 200 });
+    await SplashScreen.hide({ fadeOutDuration: 180 });
   } catch {
     // Splash screen may already be hidden
   }
 }
 
+/**
+ * Updates StatusBar colors and icon contrast without toggling overlaysWebView,
+ * preventing vertical window-inset reflows or screen jumps on theme switches.
+ */
 export async function syncAndroidStatusBar(isDark: boolean): Promise<void> {
   if (!Capacitor.isNativePlatform()) return;
   try {
-    await StatusBar.setOverlaysWebView({ overlay: false });
     await StatusBar.setBackgroundColor({
       color: isDark ? '#111722' : '#FFFFFF',
     });
@@ -33,6 +59,27 @@ export async function syncAndroidStatusBar(isDark: boolean): Promise<void> {
   } catch {
     // Ignore on platforms where StatusBar is unsupported
   }
+}
+
+/**
+ * Deterministic cold-start shell initialization:
+ * 1. Configures non-overlay StatusBar & theme colors WHILE the splash screen covers the viewport
+ * 2. Waits for web fonts (capped at 350ms so offline cold starts stay instant)
+ * 3. Waits 2 animation frames so Android WebView finishes settling WindowInsets & layout
+ * 4. Smoothly fades out the SplashScreen with zero layout jump or vertical shake
+ */
+export async function initAndroidShell(isDark: boolean): Promise<void> {
+  if (!Capacitor.isNativePlatform()) return;
+  try {
+    await StatusBar.setOverlaysWebView({ overlay: false });
+    await syncAndroidStatusBar(isDark);
+  } catch {
+    // Ignore if StatusBar plugin is unavailable
+  }
+  await waitForFontsOrTimeout(350);
+  await waitForNextFrame();
+  await waitForNextFrame();
+  await hideAndroidSplash();
 }
 
 export async function triggerAndroidHaptic(

@@ -30,6 +30,12 @@
     />
   </head>
   <body class="bg-[#F5F7FA] text-[#0F172A] dark:bg-[#0B0F17] dark:text-[#F1F5F9] antialiased selection:bg-[#1E3A8A]/20 dark:selection:bg-[#F59E0B]/30">
+    <script>
+      try {
+        var raw = localStorage.getItem('ganaka_calc_prefs_v1');
+        if (raw && JSON.parse(raw).isDark) document.documentElement.classList.add('dark');
+      } catch (e) {}
+    </script>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

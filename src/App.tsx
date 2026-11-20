@@ -11,8 +11,16 @@ import {
   type WorkspaceTab,
 } from './components/TopBar';
 import {
+  ADMOB_CONFIG,
+  cancelPendingAppOpenAd,
+  initializeAdMob,
+  maybeShowAppOpenAd,
+  recordCalculationAndMaybeShowInterstitial,
+  warmUpAdMobInventory,
+} from './utils/admobService';
+import {
   exitAndroidApp,
-  hideAndroidSplash,
+  initAndroidShell,
   registerAndroidBackButton,
   registerAndroidLifecycle,
   registerNetworkMonitor,
@@ -80,6 +88,13 @@ export default function App() {
 
   const lastBackPressRef = useRef<number>(0);
   const exitToastTimerRef = useRef<number | null>(null);
+  const shellInitializedRef = useRef<boolean>(false);
+  const initialDarkRef = useRef<boolean>(prefs.isDark);
+  const userInteractedRef = useRef<boolean>(false);
+  const wasBackgroundedRef = useRef<boolean>(false);
+  const knownHistoryIdsRef = useRef<Set<string>>(
+    new Set(state.history.map((entry) => entry.id))
+  );
   const navStateRef = useRef({
     activeTab: activeMobileTab,
     correctMode: state.correctMode,
@@ -96,12 +111,37 @@ export default function App() {
     };
   }, [activeMobileTab, state.correctMode, state.checkIndex, state.isReplaying]);
 
-  // Hide native Android splash screen once hydrated
+  // Sequence cold-start Android shell (StatusBar insets -> fonts -> 2 frames -> Splash hide),
+  // then initialize AdMob + UMP quietly after launch settles so startup never shakes or jolts.
   useEffect(() => {
-    void hideAndroidSplash();
+    let cancelled = false;
+    let adInitTimer: number | null = null;
+
+    void initAndroidShell(initialDarkRef.current).then(() => {
+      shellInitializedRef.current = true;
+      if (cancelled) return;
+
+      adInitTimer = window.setTimeout(() => {
+        if (cancelled) return;
+        void initializeAdMob().then((ready) => {
+          if (cancelled || !ready) return;
+          void maybeShowAppOpenAd({
+            waitForLoadMs: ADMOB_CONFIG.coldStartAppOpenWaitMs,
+            shouldAbort: () => cancelled || userInteractedRef.current,
+          });
+        });
+      }, 350);
+    });
+
+    return () => {
+      cancelled = true;
+      if (adInitTimer !== null) {
+        window.clearTimeout(adInitTimer);
+      }
+    };
   }, []);
 
-  // Sync Tailwind dark class on <html> and native Android StatusBar
+  // Sync Tailwind dark class on <html> and update native Android StatusBar on subsequent theme changes
   useEffect(() => {
     const root = document.documentElement;
     if (prefs.isDark) {
@@ -109,7 +149,9 @@ export default function App() {
     } else {
       root.classList.remove('dark');
     }
-    void syncAndroidStatusBar(prefs.isDark);
+    if (shellInitializedRef.current) {
+      void syncAndroidStatusBar(prefs.isDark);
+    }
     try {
       localStorage.setItem(STORAGE_PREFS_KEY, JSON.stringify(prefs));
     } catch {
@@ -167,15 +209,24 @@ export default function App() {
 
     void registerAndroidLifecycle({
       onPause: () => {
+        wasBackgroundedRef.current = true;
         dispatch({ type: 'STOP_REPLAY' });
+      },
+      onResume: () => {
+        if (!wasBackgroundedRef.current) return;
+        wasBackgroundedRef.current = false;
+        void maybeShowAppOpenAd({ waitForLoadMs: 0 });
       },
     }).then((unsub) => {
       if (disposed) unsub?.();
       else cleanupLifecycle = unsub;
     });
 
-    void registerNetworkMonitor(() => {
-      // Ganaka operates 100% locally offline; listener ensures clean lifecycle awareness without blocking UI
+    void registerNetworkMonitor((connected) => {
+      // Ganaka operates 100% locally offline; reconnect quietly warms AdMob inventory when online
+      if (connected && shellInitializedRef.current) {
+        void warmUpAdMobInventory();
+      }
     }).then((unsub) => {
       if (disposed) unsub?.();
       else cleanupNetwork = unsub;
@@ -192,12 +243,27 @@ export default function App() {
     };
   }, []);
 
-  // Persist calculation ledger
+  // Persist calculation ledger & count genuinely new completed calculations for Interstitial Ad pacing
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_HISTORY_KEY, JSON.stringify(state.history));
     } catch {
       // Ignore storage quota errors
+    }
+
+    const latestEntry = state.history[0];
+    if (!latestEntry) {
+      knownHistoryIdsRef.current.clear();
+      return;
+    }
+
+    if (!knownHistoryIdsRef.current.has(latestEntry.id)) {
+      knownHistoryIdsRef.current.add(latestEntry.id);
+      // Let the user see the computed result briefly before evaluating Interstitial Video ad eligibility
+      const timer = window.setTimeout(() => {
+        void recordCalculationAndMaybeShowInterstitial();
+      }, 180);
+      return () => window.clearTimeout(timer);
     }
   }, [state.history]);
 
@@ -212,6 +278,10 @@ export default function App() {
 
   const handleAction = useCallback(
     (action: CalculatorAction, soundVariant: 'digit' | 'action' | 'equals' = 'digit') => {
+      if (!userInteractedRef.current) {
+        userInteractedRef.current = true;
+        cancelPendingAppOpenAd();
+      }
       if (prefs.soundEnabled) {
         playKeyClick(soundVariant);
       }
